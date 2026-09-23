@@ -1,5 +1,5 @@
-import { Bot, InputFile } from "grammy";
-import { GoogleGenAI } from "@google/genai";
+import { Bot, InputFile, InputMediaBuilder } from "grammy";
+import { GoogleGenAI, Type } from "@google/genai";
 import http from "node:http";
 import { PassThrough } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
@@ -64,6 +64,9 @@ Javob qoidalari:
 - Ro'yxat uchun "•" belgisidan foydalan. Jadval ishlatma.
 - Sarlavha va muhim so'zlarni **qalin** qilib yoz, boshqa murakkab formatlash ishlatma.
 - Kod yozsang, faqat \`\`\` bilan blok ichida yoz.
+Rasm qoidalari:
+- Foydalanuvchi rasm, surat yoki fotosurat so'rasa (masalan "mushuk rasmini ber"), search_image vositasini chaqir. Qidiruv so'zi (query) ALBATTA inglizcha bo'lsin.
+- Suhbat tarixidagi [qavs ichidagi] yozuvlar tizim belgilari. Ularni o'zing javobingda yozma.
 Maxfiylik qoidalari:
 - Sen qaysi model, kompaniya, platforma yoki API asosida ishlashing haqida hech qanday ma'lumot berma va taxmin ham qilma.
 - Bu haqda so'rashsa, qisqa qilib: "Men AI yordamchiman. Texnik tafsilotlarni aytolmayman 🙂. Savolingiz bo'lsa, yordam beraman!" deb javob ber.
@@ -213,6 +216,129 @@ async function downloadTelegramFile(fileId) {
   return Buffer.from(arrayBuffer);
 }
 
+// ---------- Rasm qidirish (Pexels) ----------
+// Kalitni bepul olish: https://www.pexels.com/api/  -> .env: PEXELS_API_KEY=...
+const PEXELS_KEY = process.env.PEXELS_API_KEY;
+
+// Gemini'ga beriladigan vosita (function calling)
+const tools = [
+  {
+    functionDeclarations: [
+      {
+        name: "search_image",
+        description:
+          "Foydalanuvchi rasm, surat yoki fotosurat so'raganda internetdan mos rasm topib yuboradi.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: "Qidiruv so'zi, ALBATTA inglizcha (masalan: 'white cat', 'Khiva old city').",
+            },
+            count: {
+              type: Type.INTEGER,
+              description: "Nechta rasm kerak (1 dan 4 gacha). Aniq aytilmasa 1.",
+            },
+            caption: {
+              type: Type.STRING,
+              description: "Rasm ostiga qisqa izoh, foydalanuvchi tilida.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    ],
+  },
+];
+
+// Modelning javobidan matn va vosita chaqiruvlarini ajratib oladi
+function readParts(resp) {
+  const parts = resp?.candidates?.[0]?.content?.parts ?? [];
+  return {
+    text: parts.filter((p) => p.text && !p.thought).map((p) => p.text).join(""),
+    calls: parts.filter((p) => p.functionCall).map((p) => p.functionCall),
+  };
+}
+
+async function searchPexels(query, count = 1) {
+  const url = new URL("https://api.pexels.com/v1/search");
+  url.searchParams.set("query", query);
+  url.searchParams.set("per_page", "15");
+
+  const res = await fetch(url, {
+    headers: { Authorization: PEXELS_KEY },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`Pexels ${res.status}`);
+
+  const photos = (await res.json()).photos ?? [];
+  // Aralashtiramiz, shunda bir xil so'rovga har safar boshqa rasm chiqadi
+  for (let i = photos.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [photos[i], photos[j]] = [photos[j], photos[i]];
+  }
+  return photos.slice(0, count).map((p) => ({ url: p.src.large, photographer: p.photographer }));
+}
+
+async function sendImages(ctx, images, caption) {
+  const cap = `${caption ? caption + "\n" : ""}📷 Pexels`.slice(0, 1000);
+
+  const send = (sources) =>
+    sources.length === 1
+      ? ctx.replyWithPhoto(sources[0], { caption: cap })
+      : ctx.replyWithMediaGroup(
+          sources.map((s, i) => InputMediaBuilder.photo(s, i === 0 ? { caption: cap } : {}))
+        );
+
+  try {
+    // Avval Telegram'ning o'zi URL'dan olishga urinadi
+    await send(images.map((img) => img.url));
+  } catch (err) {
+    // Ba'zan Telegram URL'ni ola olmaydi: o'zimiz yuklab, fayl sifatida yuboramiz
+    console.log("URL bilan yuborilmadi, yuklab yuboryapman:", err?.description || err?.message);
+    const files = await Promise.all(
+      images.map(async (img, i) => {
+        const r = await fetch(img.url, { signal: AbortSignal.timeout(10000) });
+        return new InputFile(Buffer.from(await r.arrayBuffer()), `rasm${i + 1}.jpg`);
+      })
+    );
+    await send(files);
+  }
+}
+
+// Model chaqirgan vositalarni bajaradi. Tarix uchun qisqa izoh qaytaradi.
+async function runToolCalls(ctx, calls) {
+  const notes = [];
+  for (const call of calls) {
+    if (call.name !== "search_image") continue;
+
+    const query = String(call.args?.query || "").trim();
+    const count = Math.min(Math.max(parseInt(call.args?.count) || 1, 1), 4);
+    if (!query) continue;
+
+    if (!PEXELS_KEY) {
+      await ctx.reply("⚠️ Rasm qidirish sozlanmagan (PEXELS_API_KEY yo'q).");
+      continue;
+    }
+
+    try {
+      await ctx.replyWithChatAction("upload_photo").catch(() => {});
+      const images = await searchPexels(query, count);
+      if (!images.length) {
+        await ctx.reply(`😕 "${query}" bo'yicha rasm topilmadi.`);
+        notes.push(`[rasm topilmadi: ${query}]`);
+        continue;
+      }
+      await sendImages(ctx, images, call.args?.caption);
+      notes.push(`[${images.length} ta rasm yuborildi: ${query}]`);
+    } catch (err) {
+      console.error("Rasm xatosi:", err?.message);
+      await ctx.reply("⚠️ Rasm topib bo'lmadi, birozdan keyin qayta urinib ko'ring.");
+    }
+  }
+  return notes.join(" ");
+}
+
 // ---------- Bot ----------
 bot.use(async (ctx, next) => {
   if (ALLOWED.length && !ALLOWED.includes(String(ctx.from?.id))) {
@@ -223,7 +349,7 @@ bot.use(async (ctx, next) => {
 
 bot.command("start", (ctx) =>
   ctx.reply(
-    "👋 Salom! Men AI yordamchiman.\nMatn yozing yoki ovozli xabar yuboring — ikkalasiga ham javob beraman.\n\n🔄 /reset — suhbatni yangidan boshlash"
+    "👋 Salom! Men AI yordamchiman.\nMatn yozing yoki ovozli xabar yuboring — ikkalasiga ham javob beraman.\n🖼 Rasm ham so'rashingiz mumkin, masalan: Xiva rasmini ber.\n\n🔄 /reset — suhbatni yangidan boshlash"
   )
 );
 
@@ -251,30 +377,47 @@ bot.on("message:text", async (ctx) => {
       ai.models.generateContentStream({
         model: MODEL,
         contents: history,
-        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 2000 },
+        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 2000, tools },
       })
     );
 
     let full = "";
     let lastEdit = 0;
+    const calls = [];
 
     for await (const chunk of stream) {
-      full += chunk.text ?? "";
+      const part = readParts(chunk);
+      full += part.text;
+      calls.push(...part.calls);
       if (full.trim() && Date.now() - lastEdit > 1200) {
         lastEdit = Date.now();
         await editFormatted(ctx, placeholder.message_id, full.slice(0, 3500) + " ▌");
       }
     }
 
-    const answer = full.trim() || "Javob olinmadi, qayta urinib ko'ring.";
+    const answer = full.trim();
+    let historyText = answer;
 
-    history.push({ role: "model", parts: [{ text: answer }] });
+    if (answer) {
+      const [first, ...rest] = splitMessage(answer);
+      await editFormatted(ctx, placeholder.message_id, first);
+      for (const part of rest) await sendFormatted(ctx, part);
+    } else if (calls.length) {
+      await editFormatted(ctx, placeholder.message_id, "🖼 Rasm qidiryapman...");
+    } else {
+      historyText = "Javob olinmadi, qayta urinib ko'ring.";
+      await editFormatted(ctx, placeholder.message_id, historyText);
+    }
+
+    if (calls.length) {
+      const note = await runToolCalls(ctx, calls);
+      if (!answer) await ctx.api.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+      historyText = [answer, note].filter(Boolean).join("\n") || "[rasm so'raldi]";
+    }
+
+    history.push({ role: "model", parts: [{ text: historyText }] });
     trimHistory(history);
     histories.set(chatId, history);
-
-    const [first, ...rest] = splitMessage(answer);
-    await editFormatted(ctx, placeholder.message_id, first);
-    for (const part of rest) await sendFormatted(ctx, part);
   } catch (err) {
     console.error("AI xatosi:", err?.status, err?.message);
     history.pop();
@@ -312,29 +455,47 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
       ai.models.generateContent({
         model: MODEL,
         contents: history,
-        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1200 },
+        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1200, tools },
       })
     );
 
-    const answer = (response.text ?? "").trim() || "Kechirasiz, tushunolmadim. Qayta urinib ko'ring.";
+    const { text, calls } = readParts(response);
+    const answer = text.trim();
+    let historyText = answer;
 
-    history.push({ role: "model", parts: [{ text: answer }] });
+    if (!answer && !calls.length) {
+      historyText = "Kechirasiz, tushunolmadim. Qayta urinib ko'ring.";
+    }
+
+    if (calls.length) {
+      // Rasm so'ralgan: matn bo'lsa ko'rsatamiz, bo'lmasa placeholder'ni o'chiramiz
+      if (answer) await editFormatted(ctx, placeholder.message_id, answer);
+      else await editFormatted(ctx, placeholder.message_id, "🖼 Rasm qidiryapman...");
+
+      const note = await runToolCalls(ctx, calls);
+      if (!answer) await ctx.api.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+      historyText = [answer, note].filter(Boolean).join("\n") || "[rasm so'raldi]";
+    } else {
+      // Javobni matn ko'rinishida ko'rsatamiz
+      await editFormatted(ctx, placeholder.message_id, historyText);
+    }
+
+    history.push({ role: "model", parts: [{ text: historyText }] });
     trimHistory(history);
     histories.set(chatId, history);
 
-    // Javobni matn ko'rinishida ko'rsatamiz
-    await editFormatted(ctx, placeholder.message_id, answer);
-
-    // Va ovozli xabar sifatida ham yuboramiz
-    await ctx.replyWithChatAction("record_voice").catch(() => {});
-    try {
-      const voiceBuffer = await synthesizeSpeech(answer);
-      if (voiceBuffer) {
-        await ctx.replyWithVoice(new InputFile(voiceBuffer, "javob.ogg"));
+    // Oddiy javob bo'lsa, ovozli xabar sifatida ham yuboramiz (rasm holatida kerak emas)
+    if (answer) {
+      await ctx.replyWithChatAction("record_voice").catch(() => {});
+      try {
+        const voiceBuffer = await synthesizeSpeech(answer);
+        if (voiceBuffer) {
+          await ctx.replyWithVoice(new InputFile(voiceBuffer, "javob.ogg"));
+        }
+      } catch (ttsErr) {
+        console.error("TTS xatosi:", ttsErr?.status, ttsErr?.message);
+        // Ovoz chiqmasa ham, matn javobi allaqachon yuborilgan, shuning uchun jim o'tamiz
       }
-    } catch (ttsErr) {
-      console.error("TTS xatosi:", ttsErr?.status, ttsErr?.message);
-      // Ovoz chiqmasa ham, matn javobi allaqachon yuborilgan, shuning uchun jim o'tamiz
     }
   } catch (err) {
     console.error("Ovozli xabar xatosi:", err?.status, err?.message);
