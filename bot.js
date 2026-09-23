@@ -67,6 +67,7 @@ Javob qoidalari:
 Rasm qoidalari:
 - Foydalanuvchi rasm, surat yoki fotosurat so'rasa (masalan "mushuk rasmini ber"), search_image vositasini chaqir. Qidiruv so'zi (query) ALBATTA inglizcha bo'lsin.
 - Suhbat tarixidagi [qavs ichidagi] yozuvlar tizim belgilari. Ularni o'zing javobingda yozma.
+- Foydalanuvchi rasm yuborsa, uni diqqat bilan tahlil qil: nima tasvirlanganini, muhim tafsilotlarni va rasmdagi yozuvlarni tushuntir. Rasm izohida savol bo'lsa, aynan shunga javob ber.
 Maxfiylik qoidalari:
 - Sen qaysi model, kompaniya, platforma yoki API asosida ishlashing haqida hech qanday ma'lumot berma va taxmin ham qilma.
 - Bu haqda so'rashsa, qisqa qilib: "Men AI yordamchiman. Texnik tafsilotlarni aytolmayman 🙂. Savolingiz bo'lsa, yordam beraman!" deb javob ber.
@@ -281,13 +282,13 @@ async function searchPexels(query, count = 1) {
 }
 
 async function sendImages(ctx, images, caption) {
-  const cap = `${caption ? caption + "\n" : ""}📷 Pexels`.slice(0, 1000);
+  const opts = caption ? { caption: String(caption).slice(0, 1000) } : {};
 
   const send = (sources) =>
     sources.length === 1
-      ? ctx.replyWithPhoto(sources[0], { caption: cap })
+      ? ctx.replyWithPhoto(sources[0], opts)
       : ctx.replyWithMediaGroup(
-          sources.map((s, i) => InputMediaBuilder.photo(s, i === 0 ? { caption: cap } : {}))
+          sources.map((s, i) => InputMediaBuilder.photo(s, i === 0 ? opts : {}))
         );
 
   try {
@@ -349,7 +350,7 @@ bot.use(async (ctx, next) => {
 
 bot.command("start", (ctx) =>
   ctx.reply(
-    "👋 Salom! Men AI yordamchiman.\nMatn yozing yoki ovozli xabar yuboring — ikkalasiga ham javob beraman.\n🖼 Rasm ham so'rashingiz mumkin, masalan: Xiva rasmini ber.\n\n🔄 /reset — suhbatni yangidan boshlash"
+    "👋 Salom! Men AI yordamchiman.\n\nNimalar qila olaman:\n💬 Savollaringizga matn bilan javob beraman\n🎙 Ovozli xabaringizga ovoz bilan javob qaytaraman\n🖼 Xohlagan rasmingizni topib beraman, shunchaki so'rang\n📸 Yuborgan rasmingizni tahlil qilib beraman\n\n🔄 /reset — suhbatni yangidan boshlash"
   )
 );
 
@@ -501,6 +502,82 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
     console.error("Ovozli xabar xatosi:", err?.status, err?.message);
     await ctx.api
       .editMessageText(chatId, placeholder.message_id, "⚠️ Ovozli xabarni qayta ishlashda xatolik yuz berdi.")
+      .catch(() => {});
+  } finally {
+    busy.delete(chatId);
+  }
+});
+
+// ----- Rasmlar (tahlil) -----
+bot.on("message:photo", async (ctx) => {
+  const chatId = ctx.chat.id;
+  if (busy.has(chatId)) {
+    // Albom yuborilsa, qolgan rasmlarga ortiqcha ogohlantirish chiqarmaymiz
+    if (ctx.message.media_group_id) return;
+    return ctx.reply("⏳ Oldingi savolingizga javob tayyorlanmoqda, biroz kuting...");
+  }
+  busy.add(chatId);
+
+  const placeholder = await ctx.reply("🔍 Rasmni ko'rib chiqyapman...");
+  const history = histories.get(chatId) ?? [];
+
+  try {
+    const sizes = ctx.message.photo;
+    const best = sizes[sizes.length - 1]; // eng katta o'lchamdagisi
+    const imageBuffer = await downloadTelegramFile(best.file_id);
+
+    // Eski rasmlarni tarixdan olib tashlaymiz, faqat eng oxirgisi qoladi (hajm oshib ketmasin)
+    for (const turn of history) {
+      turn.parts = turn.parts.map((p) =>
+        p.inlineData?.mimeType?.startsWith("image/") ? { text: "[avvalgi rasm]" } : p
+      );
+    }
+
+    history.push({
+      role: "user",
+      parts: [
+        { inlineData: { mimeType: "image/jpeg", data: imageBuffer.toString("base64") } },
+        { text: ctx.message.caption?.trim() || "Bu rasmda nima borligini tushuntirib ber." },
+      ],
+    });
+    trimHistory(history);
+
+    const response = await callWithRotation((ai) =>
+      ai.models.generateContent({
+        model: MODEL,
+        contents: history,
+        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1500, tools },
+      })
+    );
+
+    const { text, calls } = readParts(response);
+    const answer = text.trim();
+    let historyText = answer || (calls.length ? "" : "Kechirasiz, rasmni tushunolmadim. Boshqa rasm yuborib ko'ring.");
+
+    if (answer) {
+      const [first, ...rest] = splitMessage(answer);
+      await editFormatted(ctx, placeholder.message_id, first);
+      for (const part of rest) await sendFormatted(ctx, part);
+    } else if (calls.length) {
+      await editFormatted(ctx, placeholder.message_id, "🖼 Rasm qidiryapman...");
+    } else {
+      await editFormatted(ctx, placeholder.message_id, historyText);
+    }
+
+    if (calls.length) {
+      const note = await runToolCalls(ctx, calls);
+      if (!answer) await ctx.api.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+      historyText = [answer, note].filter(Boolean).join("\n") || "[rasm so'raldi]";
+    }
+
+    history.push({ role: "model", parts: [{ text: historyText }] });
+    trimHistory(history);
+    histories.set(chatId, history);
+  } catch (err) {
+    console.error("Rasm tahlili xatosi:", err?.status, err?.message);
+    history.pop();
+    await ctx.api
+      .editMessageText(chatId, placeholder.message_id, "⚠️ Rasmni qayta ishlashda xatolik yuz berdi.")
       .catch(() => {});
   } finally {
     busy.delete(chatId);
